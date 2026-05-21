@@ -12,6 +12,7 @@ export interface Env {
 	 * Binding for static assets.
 	 */
 	ASSETS: { fetch: (request: Request) => Promise<Response> };
+	DB: D1Database; // <-- Make sure this line is here!
 }
 
 /**
