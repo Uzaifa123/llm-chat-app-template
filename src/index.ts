@@ -52,39 +52,83 @@ export default {
 /**
  * Handles chat API requests
  */
-async function handleChatRequest(
-	request: Request,
-	env: Env,
-): Promise<Response> {
+async function handleChatRequest(request: Request, env: Env): Promise<Response> {
 	try {
-		// Parse JSON request body
 		const { messages = [] } = (await request.json()) as {
 			messages: ChatMessage[];
 		};
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+		const sessionId = getSessionId(request);
+
+		// 1. Load previous chat history from D1
+		const history = await env.DB.prepare(
+			"SELECT role, message FROM chats WHERE session_id = ? ORDER BY id ASC"
+		)
+			.bind(sessionId)
+			.all();
+
+		// 2. Convert DB history into LLM format
+		const dbMessages =
+			history.results?.map((row: any) => ({
+				role: row.role,
+				content: row.message,
+			})) || [];
+
+		// 3. Add system prompt
+		const finalMessages: ChatMessage[] = [
+			{ role: "system", content: SYSTEM_PROMPT },
+			...dbMessages,
+			...messages,
+		];
+
+		// 4. Save latest user message
+		const lastUserMessage = messages[messages.length - 1];
+		if (lastUserMessage?.role === "user") {
+			await env.DB.prepare(
+				"INSERT INTO chats (session_id, role, message) VALUES (?, ?, ?)"
+			)
+				.bind(sessionId, "user", lastUserMessage.content)
+				.run();
 		}
 
+		// 5. Call AI model
 		const stream = await env.AI.run(
 			MODEL_ID,
 			{
-				messages,
+				messages: finalMessages,
 				max_tokens: 1024,
 				stream: true,
-			},
-			{
-				// Uncomment to use AI Gateway
-				// gateway: {
-				//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-				//   skipCache: false,      // Set to true to bypass cache
-				//   cacheTtl: 3600,        // Cache time-to-live in seconds
-				// },
-			},
+			}
 		);
 
-		return new Response(stream, {
+		// 6. Capture assistant response (non-stream wrapper)
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		let fullResponse = "";
+
+		const readable = new ReadableStream({
+			async start(controller) {
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					const chunk = decoder.decode(value);
+					fullResponse += chunk;
+					controller.enqueue(value);
+				}
+
+				controller.close();
+
+				// Save assistant response to DB
+				await env.DB.prepare(
+					"INSERT INTO chats (session_id, role, message) VALUES (?, ?, ?)"
+				)
+					.bind(sessionId, "assistant", fullResponse)
+					.run();
+			},
+		});
+
+		return new Response(readable, {
 			headers: {
 				"content-type": "text/event-stream; charset=utf-8",
 				"cache-control": "no-cache",
@@ -98,7 +142,7 @@ async function handleChatRequest(
 			{
 				status: 500,
 				headers: { "content-type": "application/json" },
-			},
+			}
 		);
 	}
 }
